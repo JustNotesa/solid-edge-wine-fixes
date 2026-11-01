@@ -1,0 +1,400 @@
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -3162,16 +3162,18 @@
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateSvgDocument(ID2D1DeviceContext6 *iface,
+         IStream *input_xml_stream, D2D1_SIZE_F viewport_size, ID2D1SvgDocument **svg_document)
+ {
+-    FIXME("iface %p, input_xml_stream %p, svg_document %p stub!\n", iface, input_xml_stream,
+-            svg_document);
++    TRACE("iface %p, input_xml_stream %p, svg_document %p.\n", iface, input_xml_stream, svg_document);
+ 
+-    return E_NOTIMPL;
++    return d2d_svg_document_create((ID2D1RenderTarget *)iface, input_xml_stream, viewport_size,
++            (void **)svg_document);
+ }
+ 
+ static void STDMETHODCALLTYPE d2d_device_context_DrawSvgDocument(ID2D1DeviceContext6 *iface,
+         ID2D1SvgDocument *svg_document)
+ {
+-    FIXME("iface %p, svg_document %p stub!\n", iface, svg_document);
++    TRACE("iface %p, svg_document %p.\n", iface, svg_document);
++
++    d2d_svg_document_draw((ID2D1RenderTarget *)iface, svg_document);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateColorContextFromDxgiColorSpace(
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -1119,4 +1119,7 @@
+             ellipse->point.x, ellipse->point.y, ellipse->radiusX, ellipse->radiusY);
+ }
+ 
++HRESULT d2d_svg_document_create(ID2D1RenderTarget *rt, IStream *stream, D2D1_SIZE_F viewport, void **out);
++void d2d_svg_document_draw(ID2D1RenderTarget *rt, void *doc);
++
+ #endif /* __WINE_D2D1_PRIVATE_H */
+--- a/dlls/d2d1/Makefile.in
++++ b/dlls/d2d1/Makefile.in
+@@ -22,4 +22,5 @@
+ 	sprite_batch.c \
+ 	state_block.c \
+ 	stroke.c \
++	svg.c \
+ 	wic_render_target.c
+--- /dev/null
++++ b/dlls/d2d1/svg.c
+@@ -0,0 +1,354 @@
++/*
++ * Minimal ID2D1SvgDocument implementation based on nanosvg.
++ *
++ * Parses an SVG stream with nanosvg and draws it by rasterising it into a
++ * premultiplied BGRA bitmap which is then drawn with DrawBitmap(). The DOM
++ * manipulation parts of the interface are not implemented.
++ */
++
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++#include <stdio.h>
++
++#include "d2d1_private.h"
++
++#undef strncpy
++#define NANOSVG_IMPLEMENTATION
++#define NANOSVG_ALL_COLOR_KEYWORDS
++#include "nanosvg.h"
++#define NANOSVGRAST_IMPLEMENTATION
++#include "nanosvgrast.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(d2d);
++
++static const IID IID_ID2D1SvgDocument_ = {0x86b88e4d, 0xafa4, 0x4d7b, {0x88, 0xe4, 0x68, 0xa5, 0x1c, 0x4a, 0x0a, 0xec}};
++
++struct svg_doc;
++
++struct svg_doc_vtbl
++{
++    /* IUnknown */
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)(struct svg_doc *, REFIID, void **);
++    ULONG (STDMETHODCALLTYPE *AddRef)(struct svg_doc *);
++    ULONG (STDMETHODCALLTYPE *Release)(struct svg_doc *);
++    /* ID2D1Resource */
++    void (STDMETHODCALLTYPE *GetFactory)(struct svg_doc *, ID2D1Factory **);
++    /* ID2D1SvgDocument */
++    HRESULT (STDMETHODCALLTYPE *SetViewportSize)(struct svg_doc *, D2D1_SIZE_F);
++    D2D1_SIZE_F *(STDMETHODCALLTYPE *GetViewportSize)(struct svg_doc *, D2D1_SIZE_F *);
++    HRESULT (STDMETHODCALLTYPE *SetRoot)(struct svg_doc *, void *);
++    void (STDMETHODCALLTYPE *GetRoot)(struct svg_doc *, void **);
++    HRESULT (STDMETHODCALLTYPE *FindElementById)(struct svg_doc *, const WCHAR *, void **);
++    HRESULT (STDMETHODCALLTYPE *Serialize)(struct svg_doc *, IStream *, void *);
++    HRESULT (STDMETHODCALLTYPE *Deserialize)(struct svg_doc *, IStream *, void **);
++    HRESULT (STDMETHODCALLTYPE *CreatePaint)(struct svg_doc *, UINT32, const D2D1_COLOR_F *, const WCHAR *, void **);
++    HRESULT (STDMETHODCALLTYPE *CreateStrokeDashArray)(struct svg_doc *, const void *, UINT32, void **);
++    HRESULT (STDMETHODCALLTYPE *CreatePointCollection)(struct svg_doc *, const D2D1_POINT_2F *, UINT32, void **);
++    HRESULT (STDMETHODCALLTYPE *CreatePathData)(struct svg_doc *, const float *, UINT32, const void *, UINT32, void **);
++};
++
++struct svg_doc
++{
++    const struct svg_doc_vtbl *vtbl;
++    LONG refcount;
++    ID2D1Factory *factory;
++    D2D1_SIZE_F viewport;
++    char *xml;
++    NSVGimage *image;
++};
++
++static HRESULT STDMETHODCALLTYPE svg_doc_QueryInterface(struct svg_doc *doc, REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_ID2D1SvgDocument_) || IsEqualGUID(iid, &IID_ID2D1Resource)
++            || IsEqualGUID(iid, &IID_IUnknown))
++    {
++        doc->vtbl->AddRef(doc);
++        *out = doc;
++        return S_OK;
++    }
++    WARN("%s not implemented.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE svg_doc_AddRef(struct svg_doc *doc)
++{
++    return InterlockedIncrement(&doc->refcount);
++}
++
++static ULONG STDMETHODCALLTYPE svg_doc_Release(struct svg_doc *doc)
++{
++    ULONG refcount = InterlockedDecrement(&doc->refcount);
++
++    if (!refcount)
++    {
++        if (doc->image)
++            nsvgDelete(doc->image);
++        free(doc->xml);
++        if (doc->factory)
++            ID2D1Factory_Release(doc->factory);
++        free(doc);
++    }
++    return refcount;
++}
++
++static void STDMETHODCALLTYPE svg_doc_GetFactory(struct svg_doc *doc, ID2D1Factory **factory)
++{
++    *factory = doc->factory;
++    if (*factory)
++        ID2D1Factory_AddRef(*factory);
++}
++
++static HRESULT STDMETHODCALLTYPE svg_doc_SetViewportSize(struct svg_doc *doc, D2D1_SIZE_F size)
++{
++    doc->viewport = size;
++    return S_OK;
++}
++
++static D2D1_SIZE_F * STDMETHODCALLTYPE svg_doc_GetViewportSize(struct svg_doc *doc, D2D1_SIZE_F *ret)
++{
++    *ret = doc->viewport;
++    return ret;
++}
++
++static HRESULT STDMETHODCALLTYPE svg_doc_SetRoot(struct svg_doc *doc, void *root)
++{
++    FIXME("stub.\n");
++    return E_NOTIMPL;
++}
++
++static void STDMETHODCALLTYPE svg_doc_GetRoot(struct svg_doc *doc, void **root)
++{
++    FIXME("stub.\n");
++    *root = NULL;
++}
++
++static HRESULT STDMETHODCALLTYPE svg_doc_FindElementById(struct svg_doc *doc, const WCHAR *id, void **element)
++{
++    *element = NULL;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE svg_doc_Serialize(struct svg_doc *doc, IStream *stream, void *subtree)
++{
++    ULONG written;
++
++    if (!doc->xml)
++        return E_FAIL;
++    return IStream_Write(stream, doc->xml, strlen(doc->xml), &written);
++}
++
++static HRESULT STDMETHODCALLTYPE svg_doc_Deserialize(struct svg_doc *doc, IStream *stream, void **subtree)
++{
++    FIXME("stub.\n");
++    *subtree = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT STDMETHODCALLTYPE svg_doc_CreatePaint(struct svg_doc *doc, UINT32 type, const D2D1_COLOR_F *color,
++        const WCHAR *id, void **paint)
++{
++    *paint = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT STDMETHODCALLTYPE svg_doc_CreateStrokeDashArray(struct svg_doc *doc, const void *dashes,
++        UINT32 count, void **out)
++{
++    *out = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT STDMETHODCALLTYPE svg_doc_CreatePointCollection(struct svg_doc *doc, const D2D1_POINT_2F *points,
++        UINT32 count, void **out)
++{
++    *out = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT STDMETHODCALLTYPE svg_doc_CreatePathData(struct svg_doc *doc, const float *data, UINT32 data_count,
++        const void *commands, UINT32 commands_count, void **out)
++{
++    *out = NULL;
++    return E_NOTIMPL;
++}
++
++static const struct svg_doc_vtbl svg_doc_vtbl =
++{
++    svg_doc_QueryInterface,
++    svg_doc_AddRef,
++    svg_doc_Release,
++    svg_doc_GetFactory,
++    svg_doc_SetViewportSize,
++    svg_doc_GetViewportSize,
++    svg_doc_SetRoot,
++    svg_doc_GetRoot,
++    svg_doc_FindElementById,
++    svg_doc_Serialize,
++    svg_doc_Deserialize,
++    svg_doc_CreatePaint,
++    svg_doc_CreateStrokeDashArray,
++    svg_doc_CreatePointCollection,
++    svg_doc_CreatePathData,
++};
++
++static struct svg_doc *unsafe_svg_doc(void *iface)
++{
++    struct svg_doc *doc = iface;
++
++    if (!doc || doc->vtbl != &svg_doc_vtbl)
++        return NULL;
++    return doc;
++}
++
++HRESULT d2d_svg_document_create(ID2D1RenderTarget *rt, IStream *stream, D2D1_SIZE_F viewport, void **out)
++{
++    size_t size = 0, capacity = 65536;
++    struct svg_doc *doc;
++    char *buf, *tmp;
++    ULONG read;
++    HRESULT hr;
++
++    *out = NULL;
++    if (!stream)
++        return E_INVALIDARG;
++
++    if (!(buf = malloc(capacity)))
++        return E_OUTOFMEMORY;
++    for (;;)
++    {
++        if (capacity - size < 4097)
++        {
++            capacity *= 2;
++            if (!(tmp = realloc(buf, capacity)))
++            {
++                free(buf);
++                return E_OUTOFMEMORY;
++            }
++            buf = tmp;
++        }
++        read = 0;
++        hr = IStream_Read(stream, buf + size, capacity - size - 1, &read);
++        size += read;
++        if (FAILED(hr) || !read)
++            break;
++    }
++    buf[size] = 0;
++
++    if (!(doc = calloc(1, sizeof(*doc))))
++    {
++        free(buf);
++        return E_OUTOFMEMORY;
++    }
++    doc->vtbl = &svg_doc_vtbl;
++    doc->refcount = 1;
++    doc->viewport = viewport;
++    doc->xml = buf;
++
++    /* nsvgParse() modifies its input, parse a copy. */
++    if ((tmp = strdup(buf)))
++    {
++        doc->image = nsvgParse(tmp, "px", 96.0f);
++        free(tmp);
++    }
++    if (!doc->image)
++        WARN("Failed to parse SVG document.\n");
++
++    ID2D1RenderTarget_GetFactory(rt, &doc->factory);
++
++    TRACE("Created SVG document %p, %.8ex%.8e, image %p.\n", doc, viewport.width, viewport.height, doc->image);
++    *out = doc;
++    return S_OK;
++}
++
++void d2d_svg_document_draw(ID2D1RenderTarget *rt, void *iface)
++{
++    struct svg_doc *doc = unsafe_svg_doc(iface);
++    D2D1_BITMAP_PROPERTIES props;
++    D2D1_MATRIX_3X2_F transform;
++    float sx, sy, scale, img_w, img_h, tx, ty;
++    unsigned int w, h, i;
++    ID2D1Bitmap *bitmap;
++    NSVGrasterizer *rast;
++    D2D1_RECT_F dst;
++    unsigned char *pixels;
++    D2D1_SIZE_U size;
++    HRESULT hr;
++
++    if (!doc)
++    {
++        WARN("Invalid SVG document %p.\n", iface);
++        return;
++    }
++    if (!doc->image || doc->viewport.width <= 0.0f || doc->viewport.height <= 0.0f)
++        return;
++
++    img_w = doc->image->width;
++    img_h = doc->image->height;
++    if (img_w <= 0.0f || img_h <= 0.0f)
++    {
++        img_w = doc->viewport.width;
++        img_h = doc->viewport.height;
++    }
++
++    /* Rasterise at device resolution. */
++    ID2D1RenderTarget_GetTransform(rt, &transform);
++    sx = sqrtf(transform._11 * transform._11 + transform._12 * transform._12);
++    sy = sqrtf(transform._21 * transform._21 + transform._22 * transform._22);
++    if (sx <= 0.0f) sx = 1.0f;
++    if (sy <= 0.0f) sy = 1.0f;
++
++    w = (unsigned int)ceilf(doc->viewport.width * sx);
++    h = (unsigned int)ceilf(doc->viewport.height * sy);
++    if (!w || !h || w > 8192 || h > 8192)
++        return;
++
++    /* preserveAspectRatio="xMidYMid meet" */
++    scale = fminf(w / img_w, h / img_h);
++    tx = (w - img_w * scale) / 2.0f;
++    ty = (h - img_h * scale) / 2.0f;
++
++    if (!(pixels = calloc(w * h, 4)))
++        return;
++    if (!(rast = nsvgCreateRasterizer()))
++    {
++        free(pixels);
++        return;
++    }
++    nsvgRasterize(rast, doc->image, tx, ty, scale, pixels, w, h, w * 4);
++    nsvgDeleteRasterizer(rast);
++
++    /* RGBA straight -> BGRA premultiplied. */
++    for (i = 0; i < w * h; ++i)
++    {
++        unsigned char *p = pixels + i * 4;
++        unsigned int r = p[0], g = p[1], b = p[2], a = p[3];
++
++        p[0] = (b * a + 127) / 255;
++        p[1] = (g * a + 127) / 255;
++        p[2] = (r * a + 127) / 255;
++        p[3] = a;
++    }
++
++    size.width = w;
++    size.height = h;
++    props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
++    props.dpiX = 96.0f;
++    props.dpiY = 96.0f;
++    hr = ID2D1RenderTarget_CreateBitmap(rt, size, pixels, w * 4, &props, &bitmap);
++    free(pixels);
++    if (FAILED(hr))
++    {
++        WARN("Failed to create bitmap, hr %#lx.\n", hr);
++        return;
++    }
++
++    dst.left = 0.0f;
++    dst.top = 0.0f;
++    dst.right = doc->viewport.width;
++    dst.bottom = doc->viewport.height;
++    ID2D1RenderTarget_DrawBitmap(rt, bitmap, &dst, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, NULL);
++    ID2D1Bitmap_Release(bitmap);
++}

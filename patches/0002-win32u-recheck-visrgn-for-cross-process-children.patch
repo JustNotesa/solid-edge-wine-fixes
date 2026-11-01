@@ -1,0 +1,34 @@
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -949,11 +949,29 @@
+  */
+ void update_dc( DC *dc )
+ {
+-    if (!dc->dirty) return;
++    static __thread BOOL in_update;
++
++    if (!dc->dirty)
++    {
++        HWND hwnd, root;
++
++        /* Visible region changes caused by another process (e.g. our child window being
++         * hidden by the process owning its top-level window) are not signalled to us, so
++         * a DC that is kept around would keep drawing with a stale visible region.
++         * Re-check the visible region of windows whose top-level belongs to another process. */
++        if (in_update || !dc->dce || !dc->dce->count || !(hwnd = dc->dce->hwnd)) return;
++        if (hwnd == get_desktop_window()) return;
++        if (!(root = NtUserGetAncestor( hwnd, GA_ROOT )) || is_current_process_window( root )) return;
++    }
+     dc->dirty = 0;
+     if (dc->dce)
+     {
+-        if (dc->dce->count) update_visible_region( dc->dce );
++        if (dc->dce->count)
++        {
++            in_update = TRUE;
++            update_visible_region( dc->dce );
++            in_update = FALSE;
++        }
+         else /* non-fatal but shouldn't happen */
+             WARN("DC is not in use!\n");
+     }
